@@ -1,8 +1,9 @@
 """Hebrew lyric-video renderer.
 
-Reads lyrics.txt (layout/effect tags) + timings.json (word times from align.py),
-draws the cover image with camera motion, grading, grain and beat punches, and
-writes each sung word on screen at the moment it is sung.
+Reads lyrics.txt (layout/effect tags) + timings.json (word times from align.py) and
+writes each sung word on screen at the moment it is sung, over a calm, almost static
+background. The video opens on the title cover and dissolves into the clean
+background before the singing starts, and dissolves back to the cover at the end.
 
 usage:
   python render.py --audio song.mp3 --timings timings.json --out video.mp4
@@ -28,18 +29,18 @@ W, H = 1920, 1080
 FONT_HAND = os.path.join(ASSETS, "fonts", "KtavYadCLM-BoldItalic.otf")
 FONT_HAND_LIGHT = os.path.join(ASSETS, "fonts", "KtavYadCLM-MediumItalic.otf")
 FONT_GRUNGE = os.path.join(ASSETS, "fonts", "RubikDirt-Hebrew.ttf")
-FONT_PRAYER = os.path.join(ASSETS, "fonts", "FrankRuhlLibre-Hebrew-500.ttf")
 
 CREAM = (250, 241, 220)
-GOLD = (255, 214, 140)
-RED = (255, 70, 40)
 
 SIZE = {"normal": 112, "big": 158, "huge": 250}
 SIZE_GRUNGE = {"normal": 96, "big": 132, "huge": 205}
-SIZE_PRAYER = {"normal": 118, "big": 150, "huge": 200}
+SIZE_PRAYER = {"normal": 150, "big": 200, "huge": 250}   # closing prayer: same font, larger
 
-EXIT_DUR = {"default": 0.28, "crash": 1.1, "wind": 1.1, "sink": 0.9, "fall": 0.7,
-            "glitch": 0.4, "prayer": 1.4, "angel": 0.6, "devil": 0.45}
+EXIT_DUR = {"default": 0.35, "crash": 1.2, "wind": 1.1, "sink": 0.9, "fall": 0.6,
+            "glitch": 0.5, "prayer": 1.4, "angel": 0.6, "devil": 0.5}
+
+COVER_DISSOLVE = 3.0      # seconds of cross-dissolve between the title cover and the clip
+ZOOM_END = 1.03           # background creeps from 1.00 to this zoom over the whole song
 
 
 # ----------------------------------------------------------------------------- easing
@@ -62,26 +63,6 @@ def ease_in_out(p):
     return p * p * (3 - 2 * p)
 
 
-def ease_out_back(p, s=1.9):
-    p = clamp01(p) - 1
-    return 1 + (s + 1) * p ** 3 + s * p ** 2
-
-
-def ease_out_bounce(p):
-    p = clamp01(p)
-    n, d = 7.5625, 2.75
-    if p < 1 / d:
-        return n * p * p
-    if p < 2 / d:
-        p -= 1.5 / d
-        return n * p * p + 0.75
-    if p < 2.5 / d:
-        p -= 2.25 / d
-        return n * p * p + 0.9375
-    p -= 2.625 / d
-    return n * p * p + 0.984375
-
-
 def hash01(*xs):
     h = 0
     for x in xs:
@@ -100,7 +81,7 @@ def blur(arr, r):
 
 def make_sprite(word, font, size, fill, glow=None, angle=0.0):
     """RGBA sprite of one word with soft shadow (+optional glow).
-    Returns (array, anchor_x, anchor_y): anchor = centre of the advance on the baseline."""
+    Returns (array, anchor_x, anchor_y, advance): anchor = centre of the advance on the baseline."""
     bbox = font.getbbox(word, anchor="ls", direction="rtl")
     adv = font.getlength(word, direction="rtl")
     pad = int(size * 0.55)
@@ -124,9 +105,8 @@ def make_sprite(word, font, size, fill, glow=None, angle=0.0):
     halo = gblur(m, size * 0.22) * 0.55
     shadow = gblur(shifted(m, int(size * 0.035), int(size * 0.05)), size * 0.06) * 0.85
     # premultiplied composition: halo (black) -> shadow (black) -> glow -> fill
-    a = halo
     rgb = np.zeros((h, w, 3), np.float32)
-    a = shadow + a * (1 - shadow)
+    a = shadow + halo * (1 - shadow)
     if glow is not None:
         g = np.clip(gblur(m, size * 0.16) * 1.6, 0, 1) * 0.9
         rgb = np.asarray(glow, np.float32)[None, None] * g[..., None] + rgb * (1 - g[..., None])
@@ -186,6 +166,7 @@ class WordItem:
     sprite: np.ndarray
     ax: float
     ay: float
+    adv: float = 0.0
     x: float = 0.0          # target anchor position on screen
     y: float = 0.0
     k: int = 0              # index inside its line
@@ -203,6 +184,8 @@ class LineItem:
     exit: str = "default"
     angle: float = 0.0
     seed: float = 0.0
+    space: float = 0.0
+    size: int = 0
 
 
 @dataclass
@@ -243,31 +226,29 @@ def build_scene(lyrics_path, timings_path):
             li = LineItem(ln.text, tags, sc, kind, seed=hash01(ln.index, 3))
             li.entry = next((f for f in FX_ENTRY if f in tags), "pop" if sc != "normal" else "write")
             li.exit = next((f for f in FX_EXIT if f in tags), "default")
+            tilt = 5.0 if sc == "huge" else 7.0
             if kind == "prayer":
-                li.angle = 0.0
-            else:
-                li.angle = (hash01(ln.index, 11) - 0.55) * (5.0 if sc == "huge" else 7.0)
-            path = {"hand": FONT_HAND, "grunge": FONT_GRUNGE, "prayer": FONT_PRAYER}[kind]
+                tilt = 3.0
+            li.angle = (hash01(ln.index, 11) - 0.55) * tilt
+            path = FONT_GRUNGE if kind == "grunge" else FONT_HAND
             size = {"hand": SIZE, "grunge": SIZE_GRUNGE, "prayer": SIZE_PRAYER}[kind][sc]
+            space_k = 1.7 if kind == "grunge" else 0.55
             f = font(path, size)
-            space = f.getlength(" ") * {"hand": 0.55, "grunge": 1.7, "prayer": 1.1}[kind]
-            total = sum(f.getlength(w.text.replace(",", ""), direction="rtl") for w in ln.words) + space * (len(ln.words) - 1)
+            space = f.getlength(" ") * space_k
+            total = sum(f.getlength(w.text.replace(",", ""), direction="rtl") for w in ln.words) \
+                + space * (len(ln.words) - 1)
             if total > 1720:                       # auto-shrink very long lines
                 size = int(size * 1720 / total)
                 f = font(path, size)
-                space = f.getlength(" ") * {"hand": 0.55, "grunge": 1.7, "prayer": 1.1}[kind]
-            fill = GOLD if kind == "prayer" else CREAM
-            glow = {"angel": (255, 236, 200), "devil": (120, 0, 0)}.get(li.entry)
-            if li.entry == "devil":
-                fill = (235, 38, 24)
-            elif li.entry == "angel":
-                fill = (255, 255, 252)
-            if kind == "prayer":
-                glow = (255, 170, 60)
+                space = f.getlength(" ") * space_k
+            fill, glow = CREAM, None
+            if li.entry == "angel":
+                fill, glow = (255, 255, 252), (255, 236, 200)
+            elif li.entry == "devil":
+                fill, glow = (235, 38, 24), (120, 0, 0)
             for k, w in enumerate(ln.words):
                 spr, ax, ay, adv = make_sprite(w.text.replace(",", ""), f, size, fill, glow, li.angle)
-                li.words.append(WordItem(w.text, w.start, w.end, spr, ax, ay, k=k))
-                li.words[-1].adv = adv
+                li.words.append(WordItem(w.text, w.start, w.end, spr, ax, ay, adv=adv, k=k))
             li.space = space
             li.size = size
             items.append(li)
@@ -305,7 +286,6 @@ def layout(scene):
                 w.x = cx + lx * math.cos(th)
                 w.y = cy - lx * math.sin(th)
                 x -= w.adv + ln.space
-            ln.cx, ln.cy = cx, cy
             y += hgt + gap
 
 
@@ -322,115 +302,102 @@ def timing(scene):
 
 
 # ----------------------------------------------------------------------------- word animation
-def word_ops(ln, w, card, t, fx_state):
-    """Return a list of (sprite, x, y, alpha) draw ops for one word at time t."""
+def word_ops(ln, w, card, t):
+    """Return a list of (sprite, x, y, alpha) draw ops for one word at time t.
+
+    All motion is smooth and eased: no bounces, no overshoot, no flicker, no jitter."""
     t0 = w.start - 0.05
     if t < t0:
         return []
-    k = w.k
-    te = card.t_exit + 0.03 * k
+    te = card.t_exit + 0.03 * w.k
     exit_dur = EXIT_DUR.get(ln.exit, EXIT_DUR["default"])
     if t > te + exit_dur:
         return []
     arr, ax, ay = w.sprite, w.ax, w.ay
-    x, y, alpha = w.x, w.y, 1.0
+    x, y, alpha, s = w.x, w.y, 1.0, 1.0
     dt = t - t0
     e = ln.entry
 
-    # idle float while on screen
-    y += math.sin((t + ln.seed * 10) * 1.3) * 3.0
-    life = t - card.t_in
-    s = 1.0 + 0.012 * min(life, 4.0) / 4.0
+    # very gentle idle float while on screen
+    y += math.sin((t + ln.seed * 10) * 0.9) * 2.0
+    s *= 1.0 + 0.01 * min(t - card.t_in, 4.0) / 4.0
 
     if e == "write":
         dur = min(0.5, max(0.18, 0.8 * (w.end - w.start)))
         p = ease_out_cubic(dt / dur)
         arr = wipe_rtl(arr, p)
-        y += 16 * (1 - p)
-    elif e == "pop":
-        p = dt / 0.34
-        s *= 0.55 + 0.45 * ease_out_back(p)
-        alpha = clamp01(dt / 0.12)
+        y += 14 * (1 - p)
+    elif e in ("pop", "pulse"):
+        p = dt / 0.45
+        s *= 0.86 + 0.14 * ease_out_cubic(p)
+        alpha = ease_out_cubic(dt / 0.3)
         if p < 1:
-            arr = blur(arr, 6 * (1 - ease_out_cubic(p)))
+            arr = blur(arr, 4 * (1 - ease_out_cubic(p)))
     elif e in ("stamp", "crash"):
-        p = dt / 0.16
-        s *= 1 + 1.5 * (1 - ease_in_cubic(p))
-        alpha = clamp01(dt / 0.07)
+        p = dt / 0.5
+        s *= 1 + 0.22 * (1 - ease_out_cubic(p))
+        alpha = ease_out_cubic(dt / 0.25)
         if p < 1:
-            arr = blur(arr, 5 * (1 - p))
+            arr = blur(arr, 5 * (1 - ease_out_cubic(p)))
     elif e == "slam":
-        p = dt / 0.2
-        y -= 280 * (1 - ease_in_cubic(p))
-        s *= 1 + 0.35 * (1 - ease_in_cubic(p))
-        alpha = clamp01(dt / 0.08)
+        p = dt / 0.5
+        y -= 60 * (1 - ease_out_cubic(p))
+        alpha = ease_out_cubic(dt / 0.25)
         if p < 1:
-            arr = blur(arr, 8 * (1 - p))
+            arr = blur(arr, 4 * (1 - ease_out_cubic(p)))
     elif e == "fall":
-        p = dt / 0.65
-        y -= 330 * (1 - ease_out_bounce(p))
-        alpha = clamp01(dt / 0.1)
+        p = dt / 0.55
+        y -= 80 * (1 - ease_out_cubic(p))
+        alpha = ease_out_cubic(dt / 0.3)
     elif e == "glitch":
-        alpha = 1.0 if dt > 0.45 or hash01(int(t * 30), 7) > 0.3 else 0.25
-        if dt < 0.5:
-            arr = glitch(arr, 1 - dt / 0.5, t)
-        elif hash01(int(t * 12), 3) > 0.9:
-            arr = glitch(arr, 0.35, t)
+        p = dt / 0.6
+        alpha = ease_out_cubic(dt / 0.2)
+        if p < 1:
+            arr = chroma(arr, 1 - ease_out_cubic(p))
     elif e == "angel":
         p = dt / 0.7
         alpha = ease_out_cubic(p)
-        y += 40 * (1 - ease_out_cubic(p))
+        y += 30 * (1 - ease_out_cubic(p))
         if p < 1:
-            arr = blur(arr, 10 * (1 - p))
+            arr = blur(arr, 8 * (1 - p))
     elif e == "devil":
-        alpha = 1.0 if dt > 0.45 or hash01(int(t * 24), 9) > 0.45 else 0.0
-        x += (hash01(int(t * 60), 1) - 0.5) * 10 * clamp01(1 - dt / 0.5)
+        p = dt / 0.6
+        alpha = ease_out_cubic(p)
+        if p < 1:
+            arr = blur(arr, 6 * (1 - p))
     elif e == "prayer":
         p = dt / 1.1
         alpha = ease_in_out(p)
-        y += 26 * (1 - ease_out_cubic(p))
+        y += 20 * (1 - ease_out_cubic(p))
         if p < 1:
-            arr = blur(arr, 12 * (1 - ease_out_cubic(p)))
-    elif e == "pulse":
-        p = dt / 0.3
-        s *= 0.6 + 0.4 * ease_out_back(p)
-        alpha = clamp01(dt / 0.1)
-        s *= 1 + 0.07 * fx_state["beat"]
+            arr = blur(arr, 10 * (1 - ease_out_cubic(p)))
 
     # exits
     if t > te:
         q = (t - te) / exit_dur
         x_ = ln.exit
         if x_ == "crash":
-            return crash_ops(w, arr, ax, ay, x, y, s, q)
+            return crash_ops(w, x, y, s, q)
         if x_ == "wind":
             arr, shift = wind(arr, q, w)
             ax = ax + shift
             alpha *= 1 - ease_in_cubic(q)
         elif x_ == "sink":
-            y += 150 * ease_in_cubic(q)
-            arr = blur(arr, 16 * q)
+            y += 120 * ease_in_out(q)
+            arr = blur(arr, 14 * q)
             alpha *= 1 - ease_in_out(q)
         elif x_ == "fall":
-            y += 900 * q * q
-            alpha *= 1 - ease_in_cubic(q)
-        elif x_ == "glitch":
-            arr = glitch(arr, 0.6 + q, t)
-            alpha *= 0 if q > 0.8 else 1 if hash01(int(t * 30), 5) > 0.3 else 0.3
-        elif x_ == "prayer":
-            y -= 30 * ease_in_out(q)
-            arr = blur(arr, 10 * q)
+            y += 140 * ease_in_cubic(q)
             alpha *= 1 - ease_in_out(q)
-        elif x_ == "angel":
-            y -= 60 * ease_in_cubic(q)
+        elif x_ == "glitch":
+            arr = chroma(arr, 0.3 + 0.7 * q)
+            alpha *= 1 - ease_in_out(q)
+        elif x_ in ("prayer", "angel"):
+            y -= 30 * ease_in_out(q)
             arr = blur(arr, 8 * q)
-            alpha *= 1 - q
-        elif x_ == "devil":
-            alpha *= 0 if hash01(int(t * 30), 2) > 1 - q else 1 - q
-        else:
-            y -= 22 * ease_in_cubic(q)
-            if ln.entry in ("stamp", "slam"):
-                s *= 1 + 0.15 * q
+            alpha *= 1 - ease_in_out(q)
+        else:   # default (also devil)
+            y -= 20 * ease_in_out(q)
             arr = blur(arr, 6 * q)
             alpha *= 1 - ease_in_out(q)
 
@@ -438,38 +405,32 @@ def word_ops(ln, w, card, t, fx_state):
     return [(arr, x - ax2, y - ay2, alpha)]
 
 
-def glitch(arr, amount, t):
-    """RGB-split + horizontal slice tearing."""
-    amount = max(0.0, min(1.5, amount))
-    h, w = arr.shape[:2]
-    d = int(16 * amount) + 2
+def chroma(arr, amount):
+    """Static RGB split (red left / cyan right) - a 'glitch' look without any jitter."""
+    amount = max(0.0, min(1.0, amount))
+    d = int(round(14 * amount))
+    if d < 1:
+        return arr
     a = arr[..., 3].astype(np.float32) / 255
     al = np.roll(a, -d, axis=1)
     ar = np.roll(a, d, axis=1)
     rgb = arr[..., :3].astype(np.float32)
     red = np.array([255, 30, 60], np.float32)
     cyan = np.array([30, 230, 255], np.float32)
-    wl = al * (1 - a)
-    wr = ar * (1 - a) * (1 - al)
+    wl = al * (1 - a) * 0.8
+    wr = ar * (1 - a) * (1 - al) * 0.8
     out_a = a + wl + wr
     col = (rgb * a[..., None] + red * wl[..., None] + cyan * wr[..., None]) / np.maximum(out_a, 1e-4)[..., None]
-    out = np.dstack([np.clip(col, 0, 255), np.clip(out_a * 255, 0, 255)]).astype(np.uint8)
-    seed = int(t * 20)
-    for i in range(int(3 + 5 * amount)):
-        y0 = int(hash01(seed, i, 1) * h)
-        hh = int(6 + hash01(seed, i, 2) * h * 0.1)
-        sh = int((hash01(seed, i, 3) - 0.5) * 90 * amount)
-        out[y0:y0 + hh] = np.roll(out[y0:y0 + hh], sh, axis=1)
-    return out
+    return np.dstack([np.clip(col, 0, 255), np.clip(out_a * 255, 0, 255)]).astype(np.uint8)
 
 
 def wind(arr, q, w):
-    """Thin strips of the word blow away to the left and dissolve.
+    """Thin strips of the word drift away to the left and dissolve.
     Returns (array, shift): the original content now starts `shift` px to the right."""
     if q <= 0:
         return arr, 0
     h, wd = arr.shape[:2]
-    extra = int(750 * q * q) + 2
+    extra = int(600 * q * q) + 2
     out = np.zeros((h, wd + extra, 4), np.uint8)
     strip = 4
     for i, y0 in enumerate(range(0, h, strip)):
@@ -482,7 +443,8 @@ def wind(arr, q, w):
     return out, extra
 
 
-def crash_ops(w, arr, ax, ay, x, y, s, q):
+def crash_ops(w, x, y, s, q):
+    """The word breaks into pieces that slowly drift apart, sink and fade."""
     if w.shards is None:
         h, wd = w.sprite.shape[:2]
         cols, rows = 7, 3
@@ -497,166 +459,64 @@ def crash_ops(w, arr, ax, ay, x, y, s, q):
                 cxp, cyp = (x0 + x1) / 2, (y0 + y1) / 2
                 r1, r2, r3 = hash01(i, j, 1), hash01(i, j, 2), hash01(i, j, 3)
                 shards.append(dict(img=Image.fromarray(np.ascontiguousarray(piece)), cx=cxp, cy=cyp,
-                                   vx=(cxp - w.ax) * 1.6 + (r1 - 0.5) * 500,
-                                   vy=-250 - r2 * 450, rot=(r3 - 0.5) * 540))
+                                   vx=(cxp - w.ax) * 0.5 + (r1 - 0.5) * 120,
+                                   vy=-40 - r2 * 80, rot=(r3 - 0.5) * 120))
         w.shards = shards
-    T = q * 1.1
+    T = q * EXIT_DUR["crash"]
     ops = []
     for sh in w.shards:
         px = x + (sh["cx"] - w.ax) * s + sh["vx"] * T
-        py = y + (sh["cy"] - w.ay) * s + sh["vy"] * T + 0.5 * 2600 * T * T
+        py = y + (sh["cy"] - w.ay) * s + sh["vy"] * T + 0.5 * 500 * T * T
         im = sh["img"].rotate(sh["rot"] * T, resample=Image.BILINEAR, expand=True)
         a = np.asarray(im)
-        ops.append((a, px - a.shape[1] / 2, py - a.shape[0] / 2, 1 - ease_in_cubic(q)))
+        ops.append((a, px - a.shape[1] / 2, py - a.shape[0] / 2, 1 - ease_in_out(q)))
     return ops
 
 
 # ----------------------------------------------------------------------------- background
 class Background:
-    def __init__(self, cover_path, audio_path, scene, duration):
-        src = Image.open(cover_path).convert("RGB")
+    """Calm background: fixed framing with an almost imperceptible zoom, light vignette
+    and fine film grain. `cover_mix` cross-dissolves to the title cover."""
+
+    def __init__(self, bg_path, cover_path):
         self.S = 1.5
-        big = src.resize((int(src.width * self.S), int(src.height * self.S)), Image.LANCZOS)
-        a = np.asarray(big).astype(np.float32)
-        # punchier contrast for the main look
-        a = np.clip((a - 128) * 1.08 + 128, 0, 255)
-        self.main = Image.fromarray(a.astype(np.uint8))
-        # prayer look: desaturated, warm, darker, soft
-        lum = a.mean(axis=2, keepdims=True)
-        warm = lum * np.array([1.05, 0.86, 0.62])[None, None]
-        pr = np.clip(warm * 0.75 + a * 0.12, 0, 255).astype(np.uint8)
-        self.prayer = Image.fromarray(pr).filter(ImageFilter.GaussianBlur(4))
-        self.bw, self.bh = big.size
-        self.face = (760 * self.S, 420 * self.S)
+
+        def prep(path):
+            src = Image.open(path).convert("RGB")
+            return src.resize((int(src.width * self.S), int(src.height * self.S)), Image.LANCZOS)
+
+        self.bg = prep(bg_path)
+        self.cover = prep(cover_path)
+        assert self.bg.size == self.cover.size, "cover and background must share a size"
+        self.bw, self.bh = self.bg.size
+        # 16:9 window at zoom 1 spans the full width; centre it a little above the middle
+        # so the whole title on the cover stays in frame
+        self.cy = min(max(self.bh * 0.44, self.bw * H / W / 2), self.bh - self.bw * H / W / 2)
         yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
         r = np.sqrt(((xx - W / 2) / (W / 2)) ** 2 + ((yy - H / 2) / (H / 2)) ** 2)
-        self.vig = (1 - 0.62 * np.clip(r / 1.25, 0, 1) ** 2.2)[..., None].astype(np.float32)
+        self.vig = (0.95 * (1 - 0.42 * np.clip(r / 1.3, 0, 1) ** 2.4))[..., None].astype(np.float32)
         rng = np.random.default_rng(7)
-        self.grain = [rng.normal(0, 1, (H // 2, W // 2)).astype(np.float32) for _ in range(12)]
-        ly, lx = np.mgrid[0:H * 2:2, 0:W * 3:2].astype(np.float32)
-        blob = np.exp(-(((lx - W * 0.9) / (W * 0.35)) ** 2 + ((ly - H * 0.6) / (H * 0.5)) ** 2))
-        blob += 0.7 * np.exp(-(((lx - W * 2.1) / (W * 0.3)) ** 2 + ((ly - H * 1.3) / (H * 0.45)) ** 2))
-        small = (blob[..., None] * np.array([255, 150, 70], np.float32)).astype(np.float32)
-        self.leak = np.asarray(Image.fromarray(np.clip(small, 0, 255).astype(np.uint8)).resize(
-            (W * 3 // 2 + W // 2, H * 3 // 2), Image.BILINEAR)).astype(np.float32)
-        self.duration = duration
-        self.analyse_audio(audio_path)
-        self.build_looks(scene)
-        self.particles = [dict(x=hash01(i, 1) * W, y=hash01(i, 2) * H, r=1.5 + hash01(i, 3) * 4.5,
-                               sp=10 + hash01(i, 4) * 30, ph=hash01(i, 5) * 6.28) for i in range(70)]
-        self.dot = {}
+        self.grain = [rng.normal(0, 1, (H // 2, W // 2)).astype(np.float32) for _ in range(8)]
 
-    def analyse_audio(self, path):
-        import librosa
-        raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-ac", "1", "-ar", "22050",
-                              "-f", "f32le", "-"], capture_output=True, check=True).stdout
-        y = np.frombuffer(raw, np.float32)
-        tempo, beats = librosa.beat.beat_track(y=y, sr=22050, hop_length=256, units="time")
-        self.beats = np.asarray(beats)
-        rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
-        self.rms_t = np.arange(len(rms)) * 512 / 22050
-        self.rms = rms / (np.percentile(rms, 95) + 1e-6)
-
-    def beat_env(self, t):
-        i = np.searchsorted(self.beats, t) - 1
-        if i < 0:
-            return 0.0
-        return math.exp(-(t - self.beats[i]) / 0.11)
-
-    def energy(self, t):
-        return float(np.interp(t, self.rms_t, self.rms))
-
-    def build_looks(self, scene):
-        """Keyframes of (time, brightness, punch, zoom_bias, prayer_mix) by song section."""
-        sec = {}
-        for c in scene:
-            ws = [w for ln in c.lines for w in ln.words]
-            a, b = min(w.start for w in ws), max(w.end for w in ws)
-            s = sec.setdefault(c.section, [a, b])
-            s[0], s[1] = min(s[0], a), max(s[1], b)
-        order = sorted(sec.items(), key=lambda kv: kv[1][0])
-        # (brightness, beat punch, zoom bias, prayer mix, light leak)
-        look = {"פתיחה": (0.80, 0.35, 0.00, 0, 0.10), "בית": (0.74, 0.30, 0.02, 0, 0.05),
-                "פזמון": (0.95, 1.00, 0.05, 0, 0.22), "סיום": (0.97, 1.10, 0.06, 0, 0.25),
-                "תפילה": (0.80, 0.00, 0.12, 1, 0.0)}
-        keys = [(0.0, 0.0, 0.0, -0.03, 0.0, 0.0), (3.0, 0.62, 0.0, -0.02, 0.0, 0.12)]
-        prev_end = 0.0
-        for name, (a, b) in order:
-            kind = next((k for k in look if name.startswith(k)), "בית")
-            br, pu, zb, pm, lk = look[kind]
-            if prev_end > 0 and a - prev_end > 6:   # instrumental break before this section
-                keys.append((prev_end + 1.0, 0.86, 0.85, 0.08, 0.0, 0.45))
-                keys.append((a - 1.2, 0.80, 0.6, 0.12, 0.0, 0.35))
-            if kind == "תפילה":
-                keys.append((max(a - 0.6, prev_end + 0.5), br, pu, zb, pm, lk))
-            else:
-                keys.append((a - 0.4, br, pu, zb, pm, lk))
-            keys.append((b, br, pu, zb, pm, lk))
-            prev_end = b
-        end = self.duration
-        keys.append((min(prev_end + 4.0, end - 3.0), 0.7, 0.0, 0.16, 1.0, 0.0))
-        keys.append((end - 0.6, 0.0, 0.0, 0.18, 1.0, 0.0))
-        keys.append((end + 1, 0.0, 0.0, 0.18, 1.0, 0.0))
-        keys.sort()
-        self.keys = np.array(keys, np.float32)
-        self.sections = order
-
-    def look(self, t):
-        k = self.keys
-        return [float(np.interp(t, k[:, 0], k[:, i])) for i in range(1, 6)]
-
-    def render(self, t, shake, flash):
-        bright, punch, zbias, pmix, leak = self.look(t)
-        be = self.beat_env(t) * punch
-        z = 1.06 + zbias + 0.025 * math.sin(t * 2 * math.pi / 47) + 0.018 * be
-        cx = self.face[0] * 0.25 + self.bw / 2 * 0.75 + 70 * math.sin(t * 2 * math.pi / 61)
-        cy = 700 + 35 * math.sin(t * 2 * math.pi / 43 + 1.0)
-        vw = self.bw / z
+    def render(self, t, zoom, cover_mix):
+        vw = self.bw / zoom
         vh = vw * H / W
-        cx = min(max(cx, vw / 2), self.bw - vw / 2)
-        cy = min(max(cy, vh / 2), self.bh - vh / 2)
+        cx, cy = self.bw / 2, min(max(self.cy, vh / 2), self.bh - vh / 2)
         sc = vw / W
-        data = (sc, 0, cx - vw / 2 - shake[0] * sc, 0, sc, cy - vh / 2 - shake[1] * sc)
-        img = self.main.transform((W, H), Image.AFFINE, data, resample=Image.BILINEAR) if pmix < 0.999 else None
-        arr = np.asarray(img).astype(np.float32) if img is not None else None
-        if pmix > 0.001:
-            p = np.asarray(self.prayer.transform((W, H), Image.AFFINE, data, resample=Image.BILINEAR)).astype(np.float32)
-            arr = p if arr is None else arr * (1 - pmix) + p * pmix
-        gain = bright * (1 + 0.10 * be)
-        arr *= self.vig * gain
-        if flash > 0.002:
-            arr += np.array([255, 225, 190], np.float32) * flash
-        if leak > 0.01:
-            # warm light leak drifting across the frame
-            lx = int((0.5 + 0.5 * math.sin(t * 0.21)) * (self.leak.shape[1] - W))
-            ly = int((0.5 + 0.5 * math.sin(t * 0.13 + 2)) * (self.leak.shape[0] - H))
-            arr += self.leak[ly:ly + H, lx:lx + W] * (leak * (0.75 + 0.25 * math.sin(t * 1.7)))
-        if pmix > 0.05:
-            self.draw_particles(arr, t, pmix * min(1.0, bright * 1.6))
+        data = (sc, 0, cx - vw / 2, 0, sc, cy - vh / 2)
+        arr = None
+        if cover_mix < 0.999:
+            arr = np.asarray(self.bg.transform((W, H), Image.AFFINE, data, resample=Image.BILINEAR)).astype(np.float32)
+        if cover_mix > 0.001:
+            c = np.asarray(self.cover.transform((W, H), Image.AFFINE, data, resample=Image.BILINEAR)).astype(np.float32)
+            arr = c if arr is None else arr * (1 - cover_mix) + c * cover_mix
+        arr *= self.vig
         return arr
-
-    def draw_particles(self, arr, t, amount):
-        for i, p in enumerate(self.particles):
-            r = p["r"]
-            key = round(r * 2) / 2
-            if key not in self.dot:
-                s = int(key * 6) + 3
-                yy, xx = np.mgrid[0:s, 0:s].astype(np.float32) - (s - 1) / 2
-                self.dot[key] = np.exp(-(xx ** 2 + yy ** 2) / (2 * (key * 0.9) ** 2))[..., None]
-            d = self.dot[key]
-            x = (p["x"] + 25 * math.sin(t * 0.3 + p["ph"])) % W
-            y = (p["y"] - p["sp"] * t) % H
-            fl = 0.55 + 0.45 * math.sin(t * 2.1 + p["ph"] * 3)
-            s = d.shape[0]
-            x0, y0 = int(x - s / 2), int(y - s / 2)
-            if x0 < 0 or y0 < 0 or x0 + s > W or y0 + s > H:
-                continue
-            arr[y0:y0 + s, x0:x0 + s] += d * np.array([255, 200, 120], np.float32) * (0.7 * fl * amount)
 
     def finish(self, arr, t):
         g = self.grain[int(t * 12) % len(self.grain)]
         g = np.repeat(np.repeat(g, 2, axis=0), 2, axis=1)[..., None]
-        arr += g * 5.0
+        arr += g * 3.5
         return np.clip(arr, 0, 255).astype(np.uint8)
 
 
@@ -682,90 +542,52 @@ class Renderer:
         self.duration = float(subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", args.audio],
             capture_output=True, text=True, check=True).stdout.strip())
-        self.bg = Background(args.cover, args.audio, self.scene, self.duration)
+        self.bg = Background(args.cover, args.title_cover)
         self.offset = args.offset
-        self.title = args.title
-        self.artist = args.artist
-        self.impacts = []
-        for card in self.scene:
-            for ln in card.lines:
-                for w in ln.words:
-                    if ln.entry in ("stamp", "crash"):
-                        self.impacts.append((w.start - 0.05 + 0.16, 22, 0.32))
-                    elif ln.entry == "slam":
-                        self.impacts.append((w.start - 0.05 + 0.20, 15, 0.22))
-        prev = None
-        for card in self.scene:
-            if card.section != prev and card.section.startswith(("פזמון", "סיום")):
-                self.impacts.append((card.t_in, 7, 0.22))   # chorus hits
-            prev = card.section
-        self.build_titles()
-
-    def build_titles(self):
+        first = self.scene[0].t_in
+        last = self.scene[-1]
+        last_gone = max(last.t_exit + 0.03 * len(ln.words) + EXIT_DUR.get(ln.exit, EXIT_DUR["default"])
+                        for ln in last.lines)
+        # opening: title cover, dissolving into the clip well before the first sung word
+        self.intro_out_end = max(COVER_DISSOLVE + 1.0, first - 2.5)
+        self.intro_out_start = self.intro_out_end - COVER_DISSOLVE
+        # ending: once the last line is gone, dissolve back to the title cover and stay
+        self.outro_in_start = min(last_gone + 0.6, self.duration - COVER_DISSOLVE - 1.0)
+        self.outro_in_end = self.outro_in_start + COVER_DISSOLVE
+        # corner label: visible only while the clean background is on screen
+        self.label_in = (self.intro_out_end, first - 0.5)
+        self.label_out = (self.outro_in_start - 1.2, self.outro_in_start)
         f = ImageFont.truetype(FONT_HAND_LIGHT, 52, layout_engine=ImageFont.Layout.RAQM)
         self.corner = []
-        spr, ax, ay, adv = make_sprite(self.title, f, 52, CREAM)
+        spr, ax, ay, adv = make_sprite(args.title, f, 52, CREAM)
         self.corner.append((spr, 80 + adv / 2 - ax, 88 - ay))
-        if self.artist:
-            spr, ax, ay, adv = make_sprite(self.artist, f, 52, CREAM)
+        if args.artist:
+            spr, ax, ay, adv = make_sprite(args.artist, f, 52, CREAM)
             self.corner.append((spr, W - 80 - adv / 2 - ax, 88 - ay))
-        fb = ImageFont.truetype(FONT_HAND, 165, layout_engine=ImageFont.Layout.RAQM)
-        self.big_title = make_sprite(self.title, fb, 165, CREAM)
-        if self.artist:
-            fa = ImageFont.truetype(FONT_HAND_LIGHT, 92, layout_engine=ImageFont.Layout.RAQM)
-            self.big_artist = make_sprite(self.artist, fa, 92, CREAM)
-        else:
-            self.big_artist = None
 
-    def shake_flash(self, t):
-        sx = sy = fl = 0.0
-        for ti, amp, f in self.impacts:
-            d = t - ti
-            if 0 <= d < 0.4:
-                k = math.exp(-d / 0.09)
-                sx += amp * k * math.sin(d * 95 + ti)
-                sy += amp * k * math.cos(d * 80 + ti * 2)
-                fl += f * math.exp(-d / 0.07)
-        return (sx, sy), min(fl, 0.5)
+    def cover_mix(self, t):
+        if t < self.intro_out_end:
+            return 1 - ease_in_out((t - self.intro_out_start) / COVER_DISSOLVE)
+        return ease_in_out((t - self.outro_in_start) / COVER_DISSOLVE)
 
-    def title_card(self, frame, t, t_in, t_out):
-        if t < t_in or t > t_out + 0.6:
-            return
-        spr, ax, ay, adv = self.big_title
-        p = (t - t_in) / 1.6
-        arr = wipe_rtl(spr, ease_in_out(p))
-        alpha = 1.0 if t < t_out else 1 - ease_in_out((t - t_out) / 0.6)
-        if t > t_out:
-            arr = blur(arr, 8 * (t - t_out) / 0.6)
-        blend(frame, arr, W / 2 - ax, 500 - ay, alpha)
-        if self.big_artist is not None:
-            spr, ax, ay, adv = self.big_artist
-            a2 = clamp01((t - t_in - 1.2) / 0.8) * alpha
-            blend(frame, spr, W / 2 - ax, 680 - ay, a2)
+    def zoom(self, t):
+        a, b = self.intro_out_start, self.outro_in_start
+        return 1.0 + (ZOOM_END - 1.0) * ease_in_out((t - a) / max(1.0, b - a))
 
     def frame(self, t):
-        shake, flash = self.shake_flash(t)
-        arr = self.bg.render(t, shake, flash)
+        arr = self.bg.render(t, self.zoom(t), self.cover_mix(t))
         tt = t + self.offset
-        fx_state = {"beat": self.bg.beat_env(t)}
-        first = self.scene[0].t_in
-        # intro title card + closing title
-        self.title_card(arr, t, 1.2, first - 1.3)
-        last_card = self.scene[-1]
-        end_in = last_card.t_exit + EXIT_DUR["prayer"] + 0.8
-        if end_in < self.duration - 3:
-            self.title_card(arr, t, end_in, self.duration - 1.6)
-        # corner labels (hidden during the title cards)
-        ca = clamp01((t - (first - 1.0)) / 1.0) * (1 - clamp01((t - (last_card.t_exit - 1)) / 1.5))
+        la = clamp01((t - self.label_in[0]) / max(0.1, self.label_in[1] - self.label_in[0]))
+        la *= 1 - clamp01((t - self.label_out[0]) / (self.label_out[1] - self.label_out[0]))
         for spr, x, y in self.corner:
-            blend(arr, spr, x + shake[0], y + shake[1], 0.85 * ca)
+            blend(arr, spr, x, y, 0.85 * ease_in_out(la))
         for card in self.scene:
-            if tt < card.t_in - 0.2 or tt > card.t_exit + 1.6:
+            if tt < card.t_in - 0.2 or tt > card.t_exit + 2.0:
                 continue
             for ln in card.lines:
                 for w in ln.words:
-                    for spr, x, y, a in word_ops(ln, w, card, tt, fx_state):
-                        blend(arr, spr, x + shake[0], y + shake[1], a)
+                    for spr, x, y, a in word_ops(ln, w, card, tt):
+                        blend(arr, spr, x, y, a)
         return self.bg.finish(arr, t)
 
 
@@ -782,7 +604,8 @@ def render_range(args, f0, f1, out_path):
         if (f - f0) % 150 == 0:
             print(f"[{os.getpid()}] frame {f}/{f1}", flush=True)
     p.stdin.close()
-    p.wait()
+    if p.wait() != 0:
+        sys.exit(f"ffmpeg failed for {out_path}")
 
 
 def main():
@@ -790,8 +613,11 @@ def main():
     ap.add_argument("--audio", required=True)
     ap.add_argument("--timings", default=os.path.join(HERE, "timings.json"))
     ap.add_argument("--lyrics", default=os.path.join(HERE, "lyrics.txt"))
-    ap.add_argument("--cover", default=os.path.join(ASSETS, "cover.webp"))
-    ap.add_argument("--title", default="משהו חייב להשתנות")
+    ap.add_argument("--cover", default=os.path.join(ASSETS, "cover.webp"),
+                    help="clean background image shown under the lyrics")
+    ap.add_argument("--title-cover", default=os.path.join(ASSETS, "cover_title.webp"),
+                    help="cover with the song title, shown at the start and the end")
+    ap.add_argument("--title", default="מכות עם עצמי")
     ap.add_argument("--artist", default="")
     ap.add_argument("--out", default="lyric_video.mp4")
     ap.add_argument("--fps", type=int, default=30)
