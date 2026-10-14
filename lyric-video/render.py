@@ -41,8 +41,8 @@ SIZE_GRUNGE = {"normal": 96, "big": 132, "huge": 205}
 SIZE_PRAYER = {"normal": 150, "big": 190, "huge": 250}   # closing prayer: gold serif, enlarged
 
 EXIT_DUR = {"default": 0.35, "crash": 1.2, "wind": 1.1, "sink": 0.9, "fall": 0.6,
-            "glitch": 0.5, "prayer": 0.9, "angel": 0.6, "devil": 0.5}
-ENTRY_LEAD = {"write": 0.05}   # seconds an entry starts before the sung onset (others: 0.15)
+            "glitch": 0.5, "prayer": 0.6, "angel": 0.6, "devil": 0.5}
+ENTRY_LEAD = {"write": 0.1}    # seconds an entry starts before the sung onset (others: 0.15)
 
 COVER_DISSOLVE = 3.0      # seconds of cross-dissolve from the title cover into the clip
 ZOOM_END = 1.03           # background creeps from 1.00 to this zoom over the whole song
@@ -191,6 +191,7 @@ class LineItem:
     seed: float = 0.0
     space: float = 0.0
     size: int = 0
+    t_exit: float = 0.0     # this line's own exit time (never later than its card's)
 
 
 @dataclass
@@ -288,8 +289,8 @@ def layout(scene):
             x = right
             for w in ln.words:   # Hebrew: first word on the right
                 lx = x - w.adv / 2 - cx
-                w.x = cx + lx * math.cos(th)
-                w.y = cy - lx * math.sin(th)
+                w.x = round(cx + lx * math.cos(th) - w.ax) + w.ax
+                w.y = round(cy - lx * math.sin(th) - w.ay) + w.ay
                 x -= w.adv + ln.space
             y += hgt + gap
 
@@ -303,16 +304,46 @@ def timing(scene):
         nxt = scene[i + 1].t_in if i + 1 < len(scene) else 1e9
         hold = 2.2 if card.lines[0].font_kind != "prayer" else 3.5
         t = min(nxt - 0.12, max(last.end, last.start + 0.45) + hold)
-        if i + 1 < len(scene) and _positions(card) & _positions(scene[i + 1]):
-            # the next card writes where this one sits: finish the exit before it starts
-            gone = max(EXIT_DUR.get(ln.exit, EXIT_DUR["default"]) + 0.03 * len(ln.words) for ln in card.lines)
-            t = min(t, nxt - 0.05 - gone)
         card.t_exit = max(t, last.start + 0.40)
+        for ln in card.lines:
+            ln.t_exit = card.t_exit
+            if i + 1 == len(scene):
+                continue
+            # a line that the next card writes over leaves early enough to be gone first,
+            # but never before it has been sung and shown for a moment
+            lw = max(ln.words, key=lambda w: w.start)
+            floor = max(lw.end, lw.start + 0.45) + 0.4
+            gone = EXIT_DUR.get(ln.exit, EXIT_DUR["default"]) + 0.03 * len(ln.words)
+            box = _line_box(ln)
+            for nl in scene[i + 1].lines:
+                if _boxes_touch(box, _line_box(nl)):
+                    t0 = min(w.start for w in nl.words) - ENTRY_LEAD.get(nl.entry, 0.15)
+                    ln.t_exit = min(ln.t_exit, max(floor, t0 - 0.05 - gone))
+        if card.lines[0].font_kind == "prayer":
+            # the prayer screens change as a whole
+            t = min(ln.t_exit for ln in card.lines)
+            for ln in card.lines:
+                ln.t_exit = t
 
 
-def _positions(card):
-    """(side, first-line?) slots a card occupies, e.g. {('C', 0), ('R', 1)}."""
-    return {(next((p for p in "RLC" if p in ln.tags), "R"), min(i, 1)) for i, ln in enumerate(card.lines)}
+def _line_box(ln, pad=24):
+    """Screen bounding box of a line's ink at rest (x0, y0, x1, y1), padded."""
+    xs0, ys0, xs1, ys1 = [], [], [], []
+    for w in ln.words:
+        ink = w.sprite[..., 3] > 24
+        rows, cols = np.where(ink.any(1))[0], np.where(ink.any(0))[0]
+        if not len(rows):
+            continue
+        x0, y0 = w.x - w.ax, w.y - w.ay
+        xs0.append(x0 + cols[0])
+        xs1.append(x0 + cols[-1])
+        ys0.append(y0 + rows[0])
+        ys1.append(y0 + rows[-1])
+    return (min(xs0) - pad, min(ys0) - pad, max(xs1) + pad, max(ys1) + pad)
+
+
+def _boxes_touch(a, b):
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
 
 # ----------------------------------------------------------------------------- word animation
@@ -325,7 +356,7 @@ def word_ops(ln, w, card, t):
     t0 = w.start - ENTRY_LEAD.get(e, 0.15)
     if t < t0:
         return []
-    te = card.t_exit + 0.03 * w.k
+    te = ln.t_exit + 0.03 * w.k
     exit_dur = EXIT_DUR.get(ln.exit, EXIT_DUR["default"])
     if t > te + exit_dur:
         return []
@@ -334,8 +365,8 @@ def word_ops(ln, w, card, t):
     dt = t - t0
 
     if e == "write":
-        dur = min(0.5, max(0.18, 0.8 * (w.end - w.start)))
-        arr = wipe_rtl(arr, ease_out_cubic(dt / dur))
+        dur = min(0.5, max(0.3, 0.8 * (w.end - w.start)))
+        arr = wipe_rtl(arr, ease_in_out(dt / dur))
         y += 6 * (1 - ease_in_out(dt / dur))
     elif e in ("pop", "pulse"):
         p = dt / 0.5
@@ -374,7 +405,7 @@ def word_ops(ln, w, card, t):
         if p < 1:
             arr = blur(arr, 6 * (1 - p))
     elif e == "prayer":
-        p = dt / 1.1
+        p = dt / 0.75
         alpha = ease_in_out(p)
         y += 20 * (1 - ease_out_cubic(p))
         if p < 1:
@@ -532,10 +563,33 @@ class Background:
 
 
 # ----------------------------------------------------------------------------- frame
+def subpixel(src, fx, fy):
+    """Shift an RGBA sprite right/down by a fraction of a pixel (bilinear, premultiplied).
+    The result is one pixel larger in each direction."""
+    a = src[..., 3:4].astype(np.float32) / 255.0
+    p = np.zeros((src.shape[0] + 1, src.shape[1] + 1, 4), np.float32)
+    p[1:, 1:, :3] = src[..., :3] * a
+    p[1:, 1:, 3:] = a
+    out = ((1 - fx) * (1 - fy)) * p
+    out[:, 1:] += (fx * (1 - fy)) * p[:, :-1]
+    out[1:, :] += ((1 - fx) * fy) * p[:-1, :]
+    out[1:, 1:] += (fx * fy) * p[:-1, :-1]
+    # out is the sprite moved by (fx, fy) inside a canvas whose origin is one pixel up-left
+    rgb = out[..., :3] / np.maximum(out[..., 3:], 1e-4)
+    return np.dstack([np.clip(rgb, 0, 255), np.clip(out[..., 3] * 255, 0, 255)]).astype(np.uint8)
+
+
 def blend(dst, src, x, y, alpha):
     if alpha <= 0.003:
         return
-    x, y = int(round(x)), int(round(y))
+    xi, yi = math.floor(x), math.floor(y)
+    fx, fy = x - xi, y - yi
+    if 0.02 < fx < 0.98 or 0.02 < fy < 0.98:
+        src = subpixel(src, fx, fy)
+        xi, yi = xi - 1, yi - 1
+    else:
+        xi, yi = int(round(x)), int(round(y))
+    x, y = xi, yi
     h, w = src.shape[:2]
     x0, y0, x1, y1 = max(x, 0), max(y, 0), min(x + w, W), min(y + h, H)
     if x1 <= x0 or y1 <= y0:
