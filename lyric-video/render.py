@@ -42,7 +42,8 @@ SIZE_PRAYER = {"normal": 150, "big": 190, "huge": 250}   # closing prayer: gold 
 
 EXIT_DUR = {"default": 0.35, "crash": 1.2, "wind": 1.1, "sink": 0.9, "fall": 0.6,
             "glitch": 0.5, "prayer": 0.6, "angel": 0.6, "devil": 0.5}
-ENTRY_LEAD = {"write": 0.1}    # seconds an entry starts before the sung onset (others: 0.15)
+ENTRY_LEAD = {"write": 0.18}   # seconds an entry starts before the sung onset (others: 0.15);
+                               # the write-on lead also covers the sprite's empty right margin
 
 COVER_DISSOLVE = 3.0      # seconds of cross-dissolve from the title cover into the clip
 ZOOM_END = 1.03           # background creeps from 1.00 to this zoom over the whole song
@@ -136,12 +137,15 @@ def make_sprite(word, font, size, fill, glow=None, angle=0.0):
 
 
 def scale_sprite(arr, ax, ay, s):
-    if abs(s - 1) < 0.004:
+    """Scale exactly about the anchor, keeping the canvas (no rounding to whole pixels,
+    so the size never snaps at the end of an animation)."""
+    if s == 1.0:
         return arr, ax, ay
     h, w = arr.shape[:2]
-    nw, nh = max(2, int(w * s)), max(2, int(h * s))
-    im = Image.fromarray(arr).resize((nw, nh), Image.BILINEAR)
-    return np.asarray(im), ax * nw / w, ay * nh / h
+    im = Image.fromarray(arr).transform((w, h), Image.AFFINE,
+                                        (1 / s, 0, ax - ax / s, 0, 1 / s, ay - ay / s),
+                                        resample=Image.BILINEAR)
+    return np.asarray(im), ax, ay
 
 
 def with_alpha(arr, mult):
@@ -292,6 +296,10 @@ def layout(scene):
                 w.x = round(cx + lx * math.cos(th) - w.ax) + w.ax
                 w.y = round(cy - lx * math.sin(th) - w.ay) + w.ay
                 x -= w.adv + ln.space
+            ink = _line_box(ln, 0)            # flourishes can reach past the glyph advance
+            dx = round(min(0, W - 60 - ink[2]) + max(0, 60 - ink[0]))
+            for w in ln.words:
+                w.x += dx
             y += hgt + gap
 
 
@@ -303,7 +311,7 @@ def timing(scene):
         last = max(ws, key=lambda w: w.start)
         nxt = scene[i + 1].t_in if i + 1 < len(scene) else 1e9
         hold = 2.2 if card.lines[0].font_kind != "prayer" else 3.5
-        t = min(nxt - 0.12, max(last.end, last.start + 0.45) + hold)
+        t = min(nxt - 0.02, max(last.end, last.start + 0.45) + hold)
         card.t_exit = max(t, last.start + 0.40)
         for ln in card.lines:
             ln.t_exit = card.t_exit
@@ -565,16 +573,16 @@ class Background:
 # ----------------------------------------------------------------------------- frame
 def subpixel(src, fx, fy):
     """Shift an RGBA sprite right/down by a fraction of a pixel (bilinear, premultiplied).
-    The result is one pixel larger in each direction."""
+    The result keeps the same origin and is one pixel larger to the right and bottom."""
+    h, w = src.shape[:2]
     a = src[..., 3:4].astype(np.float32) / 255.0
-    p = np.zeros((src.shape[0] + 1, src.shape[1] + 1, 4), np.float32)
-    p[1:, 1:, :3] = src[..., :3] * a
-    p[1:, 1:, 3:] = a
+    p = np.zeros((h + 1, w + 1, 4), np.float32)
+    p[:h, :w, :3] = src[..., :3] * a
+    p[:h, :w, 3:] = a
     out = ((1 - fx) * (1 - fy)) * p
     out[:, 1:] += (fx * (1 - fy)) * p[:, :-1]
     out[1:, :] += ((1 - fx) * fy) * p[:-1, :]
     out[1:, 1:] += (fx * fy) * p[:-1, :-1]
-    # out is the sprite moved by (fx, fy) inside a canvas whose origin is one pixel up-left
     rgb = out[..., :3] / np.maximum(out[..., 3:], 1e-4)
     return np.dstack([np.clip(rgb, 0, 255), np.clip(out[..., 3] * 255, 0, 255)]).astype(np.uint8)
 
@@ -586,7 +594,6 @@ def blend(dst, src, x, y, alpha):
     fx, fy = x - xi, y - yi
     if 0.02 < fx < 0.98 or 0.02 < fy < 0.98:
         src = subpixel(src, fx, fy)
-        xi, yi = xi - 1, yi - 1
     else:
         xi, yi = int(round(x)), int(round(y))
     x, y = xi, yi

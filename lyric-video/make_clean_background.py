@@ -5,7 +5,7 @@ splatter, scratches), but the singer is placed differently in the two. Using the
 own singer for the whole clip avoids a double image when the cover dissolves into the
 clip. The title letters (with their drop shadows) are masked and filled with the wall
 texture of cover.webp; next to the singer's face, where cover.webp has its own beard and
-ear, the texture is borrowed from a little further right so no second beard edge appears.
+ear, the wall texture is borrowed from further right so no second beard edge appears.
 
 usage: python make_clean_background.py assets/cover_title.webp assets/cover.webp assets/background.webp
 """
@@ -18,8 +18,9 @@ from PIL import Image
 # polygons around the painted title (1536x1024 cover coordinates). They stop at the
 # singer's beard (right) and follow the edge of his forearm (left), so he is never touched.
 TITLE_AREAS = [
-    [(908, 30), (1536, 30), (1536, 680), (908, 680)],
-    [(0, 90), (495, 90), (495, 466), (466, 470), (466, 520), (461, 560), (445, 620), (432, 660), (0, 660)],
+    [(880, 30), (1536, 30), (1536, 680), (908, 680), (908, 175), (880, 175)],
+    [(0, 90), (495, 90), (495, 462), (476, 466), (474, 492), (468, 510), (466, 520), (461, 560), (445, 620),
+     (432, 660), (0, 660)],
 ]
 # where cover.webp holds its own ear/beard edge next to the right title letter
 SINGER_EDGE = (895, 180, 965, 480)
@@ -54,14 +55,16 @@ def main():
     near = cv2.dilate(body, np.ones((161, 161), np.uint8)).astype(bool) & box
     extra = (cream(B) & ~cream(A)) | (lum(A) - lum(B) > 12)
     mask = np.maximum(mask, cv2.dilate((extra & near).astype(np.uint8), np.ones((9, 9), np.uint8)))
+    mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8))
+    mask[30:175, 880:912] = 1    # the first letter's faint shadow on the wall above the ear
     mask = (mask.astype(bool) & box).astype(np.float32)
     a = (cv2.GaussianBlur(mask, (0, 0), 4) * limit)[..., None]
     x0, y0, x1, y1 = SINGER_EDGE
-    # texture source: cover.webp, but beside the face take its wall from 60 px further right
+    # texture source: cover.webp, but beside the face take its wall from 160 px further right
     z = np.zeros(B.shape[:2], np.float32)
     z[y0:y1, x0:x1] = 1
     z = cv2.GaussianBlur(z, (0, 0), 6)[..., None]
-    fill = A * (1 - z) + np.roll(A, -60, axis=1) * z
+    fill = A * (1 - z) + np.roll(A, -160, axis=1) * z
     clean = (B * (1 - a) + fill * a).clip(0, 255).astype(np.uint8)
     # slivers of letter left where a letter touched the singer: inpaint the pure letter
     # cream (paler and less saturated than skin) along the polygon edge only
